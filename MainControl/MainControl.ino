@@ -3,14 +3,23 @@
 #include <LSM6.h>
 #include <SimpleTimer.h>
 #include <EEPROM.h>
+#include <Servo.h>
 
+// Compass settings
 bool Recalibrate = false;
 const int CalibrationDuration = 10000;
 const int CompassSampleFrequency = 10;
 int gyroscopeSampleMultiplier = 50;
-SimpleTimer CompassUpdateTimer;
 float heading = 0.0;
 const float alpha = 0.1;
+
+// Servo settings
+Servo servo;
+int servoPin = 9;
+int servoInitOffset = 78;
+
+// Solenoid settings
+int solenoidPin = 2;
 
 #pragma region Compass_Internal
   LSM6 imu;
@@ -18,32 +27,53 @@ const float alpha = 0.1;
   float invSampleFreq;
   LIS3MDL::vector<int16_t> mag_min = {32767, 32767, 32767}, mag_max = {-32768, -32768, -32768};
   int gyro_offset = 0;
+  SimpleTimer CompassUpdateTimer;
 #pragma endregion
 
 void setup() {
   Serial.begin(115200);
   Wire.begin();
 
+  // Compass init
   if (!mag.init() || !imu.init())
   {
     Serial.println("Failed to compass sensor.");
     while (1);
   }
-
   mag.enableDefault();
   imu.enableDefault();
-
   CalibrateMagnetometer();
   CalibrateGyroscope();
   invSampleFreq = (1.0f / CompassSampleFrequency); 
   CompassUpdateTimer.setInterval(1000 * invSampleFreq);
+
+  // Servo init
+  servo.attach(servoPin);
+  servo.write(servoInitOffset); // (+/-25)
+
+  // Solenoid init
+  pinMode(solenoidPin, OUTPUT);
+  digitalWrite(solenoidPin,LOW);
 }
 
 void loop() {
   if(CompassUpdateTimer.isReady())
   {
-    ReadCompass();
+    //ReadCompass();
     CompassUpdateTimer.reset();
+  }
+
+  if (Serial.available()) {
+    int number = Serial.parseInt();
+    Serial.println(String(number));
+    
+    if(number == 1)
+      digitalWrite(solenoidPin,HIGH);
+    if(number == 0)
+      digitalWrite(solenoidPin,LOW);
+  }
+  while (Serial.available() > 0) {
+      Serial.read();
   }
 }
 
