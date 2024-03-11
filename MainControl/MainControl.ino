@@ -5,9 +5,11 @@
 #include <EEPROM.h>
 #include <Servo.h>
 
-// Compass settings
+// Calibration mode
 bool Recalibrate = false;
-const int CalibrationDuration = 10000;
+int buttonPin = 12;
+
+// Compass settings
 const int CompassSampleFrequency = 10;
 int gyroscopeSampleMultiplier = 50;
 float heading = 0.0;
@@ -15,8 +17,9 @@ const float alpha = 0.1;
 
 // Servo settings
 Servo servo;
-int servoPin = 9;
-int servoInitOffset = 78;
+const int servoPin = 9;
+int servoLimit = 25;
+int targetHeading = 0;
 
 // Solenoid settings
 int solenoidPin = 2;
@@ -25,27 +28,34 @@ int solenoidPin = 2;
   LSM6 imu;
   LIS3MDL mag;
   float invSampleFreq;
-  LIS3MDL::vector<int16_t> mag_min = {32767, 32767, 32767}, mag_max = {-32768, -32768, -32768};
+  LIS3MDL::vector<int16_t> mag_min = {32767, 32767, 32767};
+  LIS3MDL::vector<int16_t> mag_max = {-32768, -32768, -32768};
   int gyro_offset = 0;
   SimpleTimer CompassUpdateTimer;
+  const int CalibrationDuration = 10000;
+#pragma endregion
+
+#pragma region Servo_Internal
+  const int servoInitOffset = 68;
+  int currentServoAngle = servoInitOffset;
+  float kp = 0.1f;
+  float kd = 0.0005f;
+  float prevError = 0.0f;
+  const float servoUpdateInterval = 0.001f;
+  SimpleTimer ServoUpdateTimer;
+#pragma endregion
+
+#pragma region Solenoid_Internal
+  SimpleTimer driveTimer;
 #pragma endregion
 
 void setup() {
   Serial.begin(115200);
   Wire.begin();
+  pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT);
 
-  // Compass init
-  if (!mag.init() || !imu.init())
-  {
-    Serial.println("Failed to compass sensor.");
-    while (1);
-  }
-  mag.enableDefault();
-  imu.enableDefault();
-  CalibrateMagnetometer();
-  CalibrateGyroscope();
-  invSampleFreq = (1.0f / CompassSampleFrequency); 
-  CompassUpdateTimer.setInterval(1000 * invSampleFreq);
+  Recalibrate = digitalRead(buttonPin);
 
   // Servo init
   servo.attach(servoPin);
@@ -54,37 +64,114 @@ void setup() {
   // Solenoid init
   pinMode(solenoidPin, OUTPUT);
   digitalWrite(solenoidPin,LOW);
+
+  // Compass init
+  if (!mag.init() || !imu.init())
+  {
+    Serial.println("Failed to compass sensor.");
+    while (true)
+    {
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(250);
+      digitalWrite(LED_BUILTIN, LOW);
+      delay(250);
+    }
+  }
+  mag.enableDefault();
+  imu.enableDefault();
+
+  digitalWrite(LED_BUILTIN, HIGH);
+  CalibrateMagnetometer();
+  CalibrateGyroscope();
+  digitalWrite(LED_BUILTIN, LOW);
+
+  invSampleFreq = (1.0f / CompassSampleFrequency); 
+  CompassUpdateTimer.setInterval(1000 * invSampleFreq);
+  ServoUpdateTimer.setInterval(1000 * servoUpdateInterval);
+  DriveForSeconds(10.0f);
+  digitalWrite(solenoidPin,HIGH);
+  delay(10);
 }
 
 void loop() {
   if(CompassUpdateTimer.isReady())
   {
-    //ReadCompass();
+    ReadCompass();
     CompassUpdateTimer.reset();
   }
 
-  if (Serial.available()) {
-    int number = Serial.parseInt();
-    Serial.println(String(number));
-    
-    if(number == 1)
-      digitalWrite(solenoidPin,HIGH);
-    if(number == 0)
-      digitalWrite(solenoidPin,LOW);
+  if(ServoUpdateTimer.isReady())
+  {
+    targetHeading = 30;
+    SteerToHeading(targetHeading);
+    ServoUpdateTimer.reset();
   }
-  while (Serial.available() > 0) {
-      Serial.read();
+
+  if(!driveTimer.isReady()) 
+  {
+    digitalWrite(solenoidPin,HIGH);
+    delay(310);
+    digitalWrite(solenoidPin,LOW);
+    delay(400);
   }
+  else
+  {
+    digitalWrite(solenoidPin,LOW);
+  }
+
+  Serial.println(String(heading) + "   " + String(currentServoAngle));
+}
+
+
+void DriveForSeconds(float seconds) {
+  driveTimer.reset();
+  driveTimer.setInterval(1000 * seconds);
+}
+
+void SteerToHeading(int setHeading) {
+  //PD controller
+  float error = setHeading - heading;
+  float output = (kp * error) + kd * ((error - prevError) / servoUpdateInterval);
+  prevError = error;
+  currentServoAngle = servoInitOffset + constrain(output * servoLimit, -servoLimit, servoLimit);
+  servo.write(currentServoAngle);
+}
+
+void ReadCompass() {
+  float tempGyroSum = 0.0f;
+  int i = 0;
+  while(i < gyroscopeSampleMultiplier)
+  {
+    imu.readGyro();
+    tempGyroSum = (imu.g.z - gyro_offset);
+    i++;
+  }
+  float gz = tempGyroSum / gyroscopeSampleMultiplier;
+  
+  mag.read();
+  float mx = mapfloat(mag.m.x, mag_min.x, mag_max.x, -1.0f, 1.0f);
+  float my = mapfloat(mag.m.y, mag_min.y, mag_max.y, -1.0f, 1.0f);
+
+  SensorFusionUpdate(gz, mx, my, invSampleFreq);
+}
+
+void SensorFusionUpdate(float gz, float mx, float my, float dt) {
+  float magAngle = atan2(my, mx) * (180 / M_PI);
+  heading = alpha * (heading + -gz * dt) + (1 - alpha) * magAngle;
+
+  heading = fmod(heading, 360.0);
+  if(heading < 0) 
+    heading += 360;
 }
 
 void CalibrateMagnetometer() {
   if (Recalibrate)
   {
-    SimpleTimer CalibrationTimer(CalibrationDuration);
+    SimpleTimer calibrationTimer(CalibrationDuration);
     Serial.println("Calibrating magnetometer: " + String(CalibrationDuration/1000) + " seconds. Rotate around Z.");
     while(true)
     {
-      if (CalibrationTimer.isReady()) { break; }
+      if (calibrationTimer.isReady()) { break; }
 
       mag.read();
       mag_min.x = min(mag_min.x, mag.m.x);
@@ -112,13 +199,13 @@ void CalibrateMagnetometer() {
 void CalibrateGyroscope() {
   if (Recalibrate)
   {
-    SimpleTimer CalibrationTimer(CalibrationDuration/2);
+    SimpleTimer calibrationTimer(CalibrationDuration/2);
     Serial.println("Calibrating gyroscope: " + String(CalibrationDuration/2000) + " seconds. Hold still.");
     float tempSum = 0.0f;
     int i = 0;
     while(true)
     {
-      if (CalibrationTimer.isReady()) { break; }
+      if (calibrationTimer.isReady()) { break; }
 
       imu.readGyro();
       tempSum += imu.g.z;
@@ -138,33 +225,6 @@ void CalibrateGyroscope() {
   }
 }
 
-void ReadCompass() {
-  float tempGyroSum = 0.0f;
-  int i = 0;
-  while(i < gyroscopeSampleMultiplier)
-  {
-    imu.readGyro();
-    tempGyroSum = (imu.g.z - gyro_offset);
-    i++;
-  }
-  float gz = tempGyroSum / gyroscopeSampleMultiplier;
-  
-  mag.read();
-  float mx = mapfloat(mag.m.x, mag_min.x, mag_max.x, -1.0f, 1.0f);
-  float my = mapfloat(mag.m.y, mag_min.y, mag_max.y, -1.0f, 1.0f);
-
-  SensorFusionUpdate(gz, mx, my, invSampleFreq);
-  Serial.println(String(heading));
-}
-
-void SensorFusionUpdate(float gz, float mx, float my, float dt) {
-  float magAngle = atan2(my, mx) * (180 / M_PI);
-  heading = alpha * (heading + -gz * dt) + (1 - alpha) * magAngle;
-
-  heading = fmod(heading, 360.0);
-}
-
-float mapfloat(float x, float in_min, float in_max, float out_min, float out_max)
-{
+float mapfloat(float x, float in_min, float in_max, float out_min, float out_max) {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
