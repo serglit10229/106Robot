@@ -23,6 +23,7 @@ int targetHeading = 0;
 
 // Solenoid settings
 int solenoidPin = 2;
+int timingSwitchPin = 7;
 
 #pragma region Compass_Internal
   LSM6 imu;
@@ -38,8 +39,8 @@ int solenoidPin = 2;
 #pragma region Servo_Internal
   const int servoInitOffset = 68;
   int currentServoAngle = servoInitOffset;
-  float kp = 0.1f;
-  float kd = 0.0005f;
+  float kp = 0.05f;
+  float kd = 0.0000f;
   float prevError = 0.0f;
   const float servoUpdateInterval = 0.001f;
   SimpleTimer ServoUpdateTimer;
@@ -47,15 +48,19 @@ int solenoidPin = 2;
 
 #pragma region Solenoid_Internal
   SimpleTimer driveTimer;
+  SimpleTimer tempTimer(3);
+  bool prevTimingPos = true;
+  int timingCounter = 0;
+  bool solenoidActive = false;
 #pragma endregion
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   Wire.begin();
   pinMode(buttonPin, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
 
-  Recalibrate = digitalRead(buttonPin);
+  Recalibrate = !digitalRead(buttonPin);
 
   // Servo init
   servo.attach(servoPin);
@@ -63,12 +68,13 @@ void setup() {
 
   // Solenoid init
   pinMode(solenoidPin, OUTPUT);
-  digitalWrite(solenoidPin,LOW);
-
+  pinMode(timingSwitchPin, INPUT_PULLUP);
+  digitalWrite(solenoidPin, LOW);
+  Serial.println("hello");
   // Compass init
   if (!mag.init() || !imu.init())
   {
-    Serial.println("Failed to compass sensor.");
+    Serial.println("Failed to find compass sensor.");
     while (true)
     {
       digitalWrite(LED_BUILTIN, HIGH);
@@ -79,18 +85,18 @@ void setup() {
   }
   mag.enableDefault();
   imu.enableDefault();
-
+  Serial.println("hello2");
   digitalWrite(LED_BUILTIN, HIGH);
   CalibrateMagnetometer();
   CalibrateGyroscope();
+  ReadCompass();
+  targetHeading = heading;
   digitalWrite(LED_BUILTIN, LOW);
 
   invSampleFreq = (1.0f / CompassSampleFrequency); 
   CompassUpdateTimer.setInterval(1000 * invSampleFreq);
   ServoUpdateTimer.setInterval(1000 * servoUpdateInterval);
-  DriveForSeconds(10.0f);
-  digitalWrite(solenoidPin,HIGH);
-  delay(10);
+  DriveForSeconds(100.0f);
 }
 
 void loop() {
@@ -102,22 +108,32 @@ void loop() {
 
   if(ServoUpdateTimer.isReady())
   {
-    targetHeading = 30;
     SteerToHeading(targetHeading);
     ServoUpdateTimer.reset();
   }
 
-  if(!driveTimer.isReady()) 
-  {
-    digitalWrite(solenoidPin,HIGH);
-    delay(310);
-    digitalWrite(solenoidPin,LOW);
-    delay(400);
-  }
-  else
-  {
-    digitalWrite(solenoidPin,LOW);
-  }
+  // if(tempTimer.isReady()) 
+  // {
+  //   bool tempPos = digitalRead(timingSwitchPin);
+  //   if(prevTimingPos == false && tempPos == true)
+  //   {
+  //     timingCounter += 1;
+  //     //Serial.println(timingCounter);
+  //   }
+  //   prevTimingPos = tempPos;
+
+  //   if((timingCounter % 2) == 0)
+  //   {
+  //     digitalWrite(solenoidPin,HIGH);
+  //     solenoidActive = true;
+  //   }
+  //   else
+  //   {
+  //     digitalWrite(solenoidPin,LOW);
+  //     solenoidActive = false;
+  //   }
+  //   tempTimer.reset();
+  // }
 
   Serial.println(String(heading) + "   " + String(currentServoAngle));
 }
