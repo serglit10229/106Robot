@@ -3,55 +3,65 @@
 #include <LSM6.h>
 #include <SimpleTimer.h>
 #include <EEPROM.h>
-#include <Servo.h>
+#include <BasicEncoder.h>
+#include <TimerOne.h>
+#include <ServoTimer2.h>
 
 // Calibration mode
+int buttonPin = 3;
 bool Recalibrate = false;
-int buttonPin = 12;
 
 // Compass settings
-const int CompassSampleFrequency = 10;
-int gyroscopeSampleMultiplier = 50;
 float heading = 0.0;
-const float alpha = 0.1;
+const float alpha = 0.0;
 
 // Servo settings
-Servo servo;
 const int servoPin = 9;
-int servoLimit = 25;
-int targetHeading = 0;
+int targetHeading = 320; //320 ,160
 
 // Solenoid settings
 int solenoidPin = 2;
-int timingSwitchPin = 7;
+float crankAngle = 0.0f;
+float solenoidAdvance = 0.0f;
+float currentRPS = 0.0f;
+float currentSpeed = 0.0f;
+
+unsigned int externalTimerCounter = 1; 
 
 #pragma region Compass_Internal
   LSM6 imu;
   LIS3MDL mag;
-  float invSampleFreq;
   LIS3MDL::vector<int16_t> mag_min = {32767, 32767, 32767};
   LIS3MDL::vector<int16_t> mag_max = {-32768, -32768, -32768};
   int gyro_offset = 0;
-  SimpleTimer CompassUpdateTimer;
+  const int compassUpdateFrequency = 100; //ms
+  const int gyroSampleFrequency = 2; //ms 
+  long tempGyroSum = 0;
+  int gyroSampleCounter = 0;
   const int CalibrationDuration = 10000;
 #pragma endregion
 
 #pragma region Servo_Internal
-  const int servoInitOffset = 68;
+  ServoTimer2 servo;
+  SimpleTimer steerDelayTimer;
+  SimpleTimer bonusDelayTimer;
+  const int servoInitOffset = 1500;
+  int servoLimit = 200;
   int currentServoAngle = servoInitOffset;
-  float kp = 0.05f;
+  float kp = 0.03f;
   float kd = 0.0000f;
   float prevError = 0.0f;
-  const float servoUpdateInterval = 0.001f;
-  SimpleTimer ServoUpdateTimer;
+  const int servoUpdateInterval = 10; //ms
 #pragma endregion
 
 #pragma region Solenoid_Internal
   SimpleTimer driveTimer;
-  SimpleTimer tempTimer(3);
-  bool prevTimingPos = true;
-  int timingCounter = 0;
   bool solenoidActive = false;
+  BasicEncoder encoder(11, 12);
+  float encoderResolution = 20;
+  int prevEncoderPos = 0;
+  unsigned long prevEncoderTime; 
+  float wheelRadius = 0.065f;
 #pragma endregion
 
 void setup() {
@@ -62,15 +72,98 @@ void setup() {
 
   Recalibrate = !digitalRead(buttonPin);
 
-  // Servo init
-  servo.attach(servoPin);
-  servo.write(servoInitOffset); // (+/-25)
+  ServoInit();
+  SolenoidInit();
+  CompassInit();
 
-  // Solenoid init
+  delay(11000);
+
+  prevEncoderTime = millis();
+  DriveForSeconds(26.0f, 23.0f); //26,23
+  SteerAfterSeconds(3.8f); //4.2
+
+  Timer1.initialize(1000);
+  Timer1.attachInterrupt(ExternalTimer);
+}
+
+void ExternalTimer() {
+  encoder.service();
+
+  if((externalTimerCounter % servoUpdateInterval) == 0)
+  {
+    if(!driveTimer.isReady())
+    {
+      SteerToHeading(targetHeading);
+    }
+  }
+
+  if((externalTimerCounter % gyroSampleFrequency) == 0)
+  {
+    ReadGyro();
+  }
+
+  if((externalTimerCounter % compassUpdateFrequency) == 0)
+  {
+    ReadCompass();
+  }
+
+  externalTimerCounter++;
+}
+
+void loop() {
+  mag.read();
+  imu.readGyro();
+  ReadEncoder();
+  
+  if(steerDelayTimer.isReady()) {
+    targetHeading = 40;
+    if(bonusDelayTimer.isReady())
+      targetHeading = 100;
+  }
+
+  if(!driveTimer.isReady())
+  {
+    if(fmod(crankAngle+solenoidAdvance, 360.0) < (180.0f - 25.0f))
+    {
+      digitalWrite(solenoidPin,HIGH);
+      solenoidActive = true;
+    }
+    else
+    {
+      digitalWrite(solenoidPin,LOW);
+      solenoidActive = false;
+    }
+  }
+  else
+  {
+    SteerToValue(0.0f);
+    digitalWrite(solenoidPin,LOW);
+    solenoidActive = false;
+  }
+  Serial.println(String(heading) + "   " + String(currentServoAngle) + "   " + String(crankAngle));
+}
+
+void ServoInit() {
+  servo.attach(servoPin);
+  SteerToValue(0.0f);
+  delay(500);
+  SteerToValue(1.0f);
+  delay(500);
+  SteerToValue(-1.0f);
+  delay(500);
+  SteerToValue(0.0f);
+}
+
+void SolenoidInit() {
   pinMode(solenoidPin, OUTPUT);
-  pinMode(timingSwitchPin, INPUT_PULLUP);
   digitalWrite(solenoidPin, LOW);
-  Serial.println("hello");
+  // delay(1000);
+  // digitalWrite(solenoidPin, HIGH);
+  // delay(1000);
+  // digitalWrite(solenoidPin, LOW);
+}
+
+void CompassInit() {
   // Compass init
   if (!mag.init() || !imu.init())
   {
@@ -85,95 +178,91 @@ void setup() {
   }
   mag.enableDefault();
   imu.enableDefault();
-  Serial.println("hello2");
   digitalWrite(LED_BUILTIN, HIGH);
   CalibrateMagnetometer();
   CalibrateGyroscope();
-  ReadCompass();
-  targetHeading = heading;
   digitalWrite(LED_BUILTIN, LOW);
-
-  invSampleFreq = (1.0f / CompassSampleFrequency); 
-  CompassUpdateTimer.setInterval(1000 * invSampleFreq);
-  ServoUpdateTimer.setInterval(1000 * servoUpdateInterval);
-  DriveForSeconds(100.0f);
+  ReadCompass();
 }
 
-void loop() {
-  if(CompassUpdateTimer.isReady())
-  {
-    ReadCompass();
-    CompassUpdateTimer.reset();
-  }
-
-  if(ServoUpdateTimer.isReady())
-  {
-    SteerToHeading(targetHeading);
-    ServoUpdateTimer.reset();
-  }
-
-  // if(tempTimer.isReady()) 
-  // {
-  //   bool tempPos = digitalRead(timingSwitchPin);
-  //   if(prevTimingPos == false && tempPos == true)
-  //   {
-  //     timingCounter += 1;
-  //     //Serial.println(timingCounter);
-  //   }
-  //   prevTimingPos = tempPos;
-
-  //   if((timingCounter % 2) == 0)
-  //   {
-  //     digitalWrite(solenoidPin,HIGH);
-  //     solenoidActive = true;
-  //   }
-  //   else
-  //   {
-  //     digitalWrite(solenoidPin,LOW);
-  //     solenoidActive = false;
-  //   }
-  //   tempTimer.reset();
-  // }
-
-  Serial.println(String(heading) + "   " + String(currentServoAngle));
-}
-
-
-void DriveForSeconds(float seconds) {
+void DriveForSeconds(float seconds, float bonusStartSeconds) {
   driveTimer.reset();
   driveTimer.setInterval(1000 * seconds);
+  bonusDelayTimer.reset();
+  bonusDelayTimer.setInterval(1000 * bonusStartSeconds);
+}
+
+void SteerAfterSeconds(float seconds) {
+  steerDelayTimer.reset();
+  steerDelayTimer.setInterval(1000 * seconds);
+}
+
+void SteerToValue(float setValue) {
+  currentServoAngle = servoInitOffset + constrain(-setValue * servoLimit, -servoLimit, servoLimit);
+  servo.write(currentServoAngle);
 }
 
 void SteerToHeading(int setHeading) {
   //PD controller
-  float error = setHeading - heading;
-  float output = (kp * error) + kd * ((error - prevError) / servoUpdateInterval);
+  float error = (setHeading - heading);
+  if(abs(setHeading - heading) > 179)
+  {
+    error = 360 - abs(setHeading - heading);
+  }
+
+  //float error = (setHeading - heading);
+  float output = (kp * error) + kd * ((error - prevError) / (servoUpdateInterval / 1000.0f));
+
+  //Serial.println("heading: " + String(heading) + " error: " + String(error));  
+
   prevError = error;
-  currentServoAngle = servoInitOffset + constrain(output * servoLimit, -servoLimit, servoLimit);
-  servo.write(currentServoAngle);
+  SteerToValue(-output);
+}
+
+void ReadEncoder() {
+  int tempEncoderPos = -(encoder.get_count());
+  //Serial.println(tempEncoderPos);
+  unsigned long tempTime = millis();
+  crankAngle = (tempEncoderPos / encoderResolution) * 360.0f;
+
+  int deltaEncoderPos = tempEncoderPos - prevEncoderPos;
+  int deltaEncoderTime = tempTime - prevEncoderTime;
+  if(deltaEncoderTime == 0) return;
+  
+  currentRPS = (deltaEncoderPos / encoderResolution) / (deltaEncoderTime / 1000);
+  currentSpeed = wheelRadius * ((deltaEncoderPos / encoderResolution) * 6.2832f) / (deltaEncoderTime / 1000);
+  if(encoder.get_change())
+  {
+    prevEncoderPos = tempEncoderPos;
+    prevEncoderTime = tempTime;
+  }
 }
 
 void ReadCompass() {
-  float tempGyroSum = 0.0f;
-  int i = 0;
-  while(i < gyroscopeSampleMultiplier)
-  {
-    imu.readGyro();
-    tempGyroSum = (imu.g.z - gyro_offset);
-    i++;
-  }
-  float gz = tempGyroSum / gyroscopeSampleMultiplier;
-  
-  mag.read();
-  float mx = mapfloat(mag.m.x, mag_min.x, mag_max.x, -1.0f, 1.0f);
-  float my = mapfloat(mag.m.y, mag_min.y, mag_max.y, -1.0f, 1.0f);
+  float mx = Mapfloat(mag.m.x, mag_min.x, mag_max.x, -1.0f, 1.0f);
+  float my = Mapfloat(mag.m.y, mag_min.y, mag_max.y, -1.0f, 1.0f);
 
-  SensorFusionUpdate(gz, mx, my, invSampleFreq);
+  int gz = 0;
+  if(gyroSampleCounter > 0)
+  {
+    gz = tempGyroSum / gyroSampleCounter;
+    if(abs(gz) < 200)
+      gz = 0;
+    tempGyroSum = 0;
+    gyroSampleCounter = 0;
+  }
+  SensorFusionUpdate(gz, mx, my, compassUpdateFrequency/1000.0f);
+}
+
+void ReadGyro() {
+  tempGyroSum += (imu.g.z - gyro_offset);
+  gyroSampleCounter++;
 }
 
 void SensorFusionUpdate(float gz, float mx, float my, float dt) {
   float magAngle = atan2(my, mx) * (180 / M_PI);
-  heading = alpha * (heading + -gz * dt) + (1 - alpha) * magAngle;
+  heading = alpha * (heading + (-0.01 * gz * dt)) + (1 - alpha) * magAngle;
+  //Serial.println("gz: " + String((-0.01 * gz * dt)) + " heading: " + String(heading));
 
   heading = fmod(heading, 360.0);
   if(heading < 0) 
@@ -185,9 +274,8 @@ void CalibrateMagnetometer() {
   {
     SimpleTimer calibrationTimer(CalibrationDuration);
     Serial.println("Calibrating magnetometer: " + String(CalibrationDuration/1000) + " seconds. Rotate around Z.");
-    while(true)
+    while(!calibrationTimer.isReady())
     {
-      if (calibrationTimer.isReady()) { break; }
 
       mag.read();
       mag_min.x = min(mag_min.x, mag.m.x);
@@ -217,17 +305,16 @@ void CalibrateGyroscope() {
   {
     SimpleTimer calibrationTimer(CalibrationDuration/2);
     Serial.println("Calibrating gyroscope: " + String(CalibrationDuration/2000) + " seconds. Hold still.");
-    float tempSum = 0.0f;
+    long tempSum = 0;
     int i = 0;
-    while(true)
+    while(!calibrationTimer.isReady())
     {
-      if (calibrationTimer.isReady()) { break; }
 
       imu.readGyro();
       tempSum += imu.g.z;
       i++;
 
-      delay(10);
+      delay(2);
     }
     gyro_offset = tempSum/i;
     Serial.println("Magnetometer calibrated");
@@ -241,6 +328,14 @@ void CalibrateGyroscope() {
   }
 }
 
-float mapfloat(float x, float in_min, float in_max, float out_min, float out_max) {
+float Mapfloat(float x, float in_min, float in_max, float out_min, float out_max) {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+float GetOdometer() {
+  return wheelRadius * (crankAngle / 6.28318531);
+}
+
+int DegToMicroseconds(int deg) {
+  return (deg * 5.55555555556f) + 1000;
 }
